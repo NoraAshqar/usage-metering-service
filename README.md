@@ -98,6 +98,106 @@ curl -X PATCH localhost:3000/plans/5 -H "x-api-key: <key>" -H "content-type: app
   -d '{"monthlyLimit":300}'
 ```
 
+### Consume units
+
+`POST /consume` with `{ userId, units, requestId }`:
+
+```bash
+curl -X POST localhost:3000/consume -H "x-api-key: <key>" -H "content-type: application/json" \
+  -d '{"userId":"alice","units":25,"requestId":"doc-123"}'
+```
+
+```json
+{
+  "requestId": "doc-123",
+  "userId": "alice",
+  "units": 25,
+  "accepted": false,
+  "rejectedBy": { "level": "user", "rule": "max_units_per_request" },
+  "month": "2026-10",
+  "remaining": { "account": 10000, "user": 1000 },
+  "replayed": false,
+  "decidedAt": "2026-10-15T09:12:44.120Z"
+}
+```
+
+- A decision is always `200`. When `accepted` is `false`, `rejectedBy` names the rule and
+  whether it belongs to the account or the user plan. A rejection consumes nothing.
+- `remaining` is what is left this month after this decision, for the account and the user.
+- `4xx` means the request itself was wrong: `400` invalid input, `401` API key, `404` unknown user,
+  `409` requestId already used for a different request.
+
+## Rules
+
+Each plan has two rules, and a request must satisfy **both** the account plan and the user plan:
+
+| Rule | Meaning |
+|---|---|
+| `max_units_per_request` | the most units one request may consume |
+| `monthly_limit` | the total units available in a UTC calendar month |
+
+Rules are checked in this order, and the first one that fails is reported:
+
+1. user `max_units_per_request`
+2. account `max_units_per_request`
+3. user `monthly_limit`
+4. account `monthly_limit`
+
+Per-request rules come first because waiting will not fix them, only a smaller request or a
+plan change. An accepted request adds its units to the user's usage **and** to the account's
+usage, so the account's usage is always the sum of its users' usage.
+
+Usage is stored per UTC month (`2026-10-01` = October 2026). A new month starts at zero for
+both levels. Previous months stay in the database.
+
+## Plan changes
+
+- `consume` reads the account plan and the user plan **on every request**. A plan update or a
+  plan switch applies to the next request after it succeeds, with no restart.
+- Switching plans keeps the units already used this month: there is no fresh allowance.
+- If a monthly limit is lowered below what was already used, `remaining` is shown as `0`
+  (never negative) and further requests are rejected at that level.
+- Past decisions in the request history are never changed.
+
+## Retries (`requestId`)
+
+The caller sends a unique `requestId` for every action. If a response is lost, the caller can
+safely send the **same** request again:
+
+| Retry | Result |
+|---|---|
+| same `requestId`, same `userId` and `units` | the **original** decision, with `replayed: true`. Nothing is consumed again |
+| same `requestId`, different `userId` or `units` | `409 request_id_conflict` |
+
+A retry is never re-evaluated. A request that was rejected stays rejected even if the plan
+changed since then, and an accepted request stays accepted. To try again after a rejection,
+send a new `requestId`. Every `requestId` belongs to one account, so two accounts may use the same value.
+
+## How concurrent requests stay correct
+
+`consume` runs in one database transaction:
+
+1. Find the user inside the calling account (`404` otherwise).
+2. Create this month's `account_usage` row if it is missing, then **lock** it (`SELECT ... FOR UPDATE`).
+3. Look for an earlier request with the same `requestId` and return it if there is one.
+4. Create and lock the user's `user_usage` row.
+5. Read both current plans and evaluate the rules (`rules.ts`, a pure function).
+6. If accepted, add the units to both counters.
+7. Save the decision in `consume_requests` and commit.
+
+The lock in step 2 makes requests **of the same account** run one after another from that
+point, so two requests can never both read the same `used` value. Requests of different
+accounts don't wait for each other. The account row is always locked before the user row,
+so two transactions can never wait for each other (no deadlocks). The `requestId` check comes
+after the lock: if the same `requestId` arrives twice at once, the second one waits and then
+finds the first one's saved decision.
+
+`tests/concurrency.test.ts` sends 50 parallel requests against a 100-unit user allowance and
+40 parallel requests against a 100-unit account allowance, and checks that exactly 100 units are
+accepted and that the counters match the request history. As a check of the test itself, we
+removed `FOR UPDATE` and ran it again: 27 of the 50 requests were accepted (270 units for a
+100-unit allowance), so the test does catch the race.
+
 ## Product assumptions
 
 - **Default plans:** an account created without `planId` gets **Starter**; a user gets **Basic**.
@@ -119,10 +219,13 @@ curl -X PATCH localhost:3000/plans/5 -H "x-api-key: <key>" -H "content-type: app
 - **Plans cannot be deleted.** Deleting a plan that is assigned, or that past requests were
   decided under, would need extra rules; it is not required, so it is left out.
 
+- **A rejection is a normal answer** (`200` with `accepted: false`), not an HTTP error, so the
+  caller can tell "not allowed by the plan" apart from "your request was wrong".
+- **Rejected requests are stored** in the history too, so a caller can see why an action failed.
+- **The month of a request** is the UTC month in which the service processes it.
+
 ## TODO
-- Rules and plan changes
-- Retry behaviour (requestId)
-- Product assumptions
+- Usage and history API
 - Design decisions
 - Performance results
 - Known limitations

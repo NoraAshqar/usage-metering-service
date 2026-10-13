@@ -1,5 +1,10 @@
-import { Pool, PoolClient } from 'pg';
+import { Pool, PoolClient, types } from 'pg';
 import { config } from './config';
+
+// Return DATE columns (our `month`) as the plain string '2026-10-01'.
+// By default pg turns them into a JS Date at LOCAL midnight, which can shift the day by timezone.
+const DATE_TYPE_OID = 1082;
+types.setTypeParser(DATE_TYPE_OID, (value) => value);
 
 // One shared pool of connections for the whole service.
 export const pool = new Pool({ connectionString: config.databaseUrl, max: 20 });
