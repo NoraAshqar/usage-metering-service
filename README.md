@@ -74,6 +74,30 @@ curl -X POST localhost:3000/users -H "x-api-key: <key>" \
   -H "content-type: application/json" -d '{"userId":"alice","planId":4}'
 ```
 
+### Plans
+
+| Method | Path | Body | Result |
+|---|---|---|---|
+| GET | `/plans` | - | `{ plans }`: predefined plans, then my custom plans |
+| GET | `/plans/:planId` | - | one plan (`404` for another account's plan) |
+| POST | `/plans` | `{ name, scope, monthlyLimit, maxUnitsPerRequest }` | `201` the new custom plan |
+| PATCH | `/plans/:planId` | any of `{ name, monthlyLimit, maxUnitsPerRequest }` | the updated plan |
+
+`scope` is `"account"` (assignable to the account) or `"user"` (assignable to its users).
+A plan is returned as:
+
+```json
+{ "id": 5, "name": "Gold", "scope": "user", "monthlyLimit": 2000, "maxUnitsPerRequest": 50, "predefined": false }
+```
+
+```bash
+curl -X POST localhost:3000/plans -H "x-api-key: <key>" -H "content-type: application/json" \
+  -d '{"name":"Gold","scope":"user","monthlyLimit":2000,"maxUnitsPerRequest":50}'
+
+curl -X PATCH localhost:3000/plans/5 -H "x-api-key: <key>" -H "content-type: application/json" \
+  -d '{"monthlyLimit":300}'
+```
+
 ## Product assumptions
 
 - **Default plans:** an account created without `planId` gets **Starter**; a user gets **Basic**.
@@ -83,9 +107,19 @@ curl -X POST localhost:3000/users -H "x-api-key: <key>" \
 - **Isolation:** a user of another account is answered with `404`, exactly like a user that does not exist.
   The same `userId` may exist in two different accounts.
 - **Creating accounts** needs a single admin key from the environment. There are no admin users or roles.
+- **Predefined plans are read-only** (`403 plan_read_only`). To get different limits, create a custom plan.
+- **Plans are shared by reference.** Users on the same plan share the plan *definition*, not the
+  allowance: each user still has their own usage. Updating a custom plan changes the limits for
+  everyone assigned to it, starting with their next request.
+- **A plan's scope cannot change** after it is created, so existing assignments always stay valid.
+- **Plan names are unique** per account and scope (`409 plan_name_taken`). The same name may be
+  used by another account, or by the same account for the other scope.
+- **`monthlyLimit` may be 0** (a plan that blocks all consumption, e.g. a suspended account).
+  `maxUnitsPerRequest` must be at least 1.
+- **Plans cannot be deleted.** Deleting a plan that is assigned, or that past requests were
+  decided under, would need extra rules; it is not required, so it is left out.
 
 ## TODO
-- Plans API
 - Rules and plan changes
 - Retry behaviour (requestId)
 - Product assumptions
