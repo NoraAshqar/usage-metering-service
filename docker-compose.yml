@@ -41,5 +41,21 @@ services:
       service:
         condition: service_healthy
 
+  loadtest:
+    build: ./load-test
+    profiles: ["loadtest"]
+    environment:
+      SERVICE_URL: http://service:3000
+      ADMIN_KEY: admin-secret
+      DATABASE_URL: postgres://metering:metering@db:5432/metering
+      LABEL: ${LABEL:-run}
+      DURATION: ${DURATION:-15}
+      CONNECTIONS: ${CONNECTIONS:-50}
+    volumes:
+      - ./load-test/results:/app/results
+    depends_on:
+      service:
+        condition: service_healthy
+
 volumes:
   pgdata:
