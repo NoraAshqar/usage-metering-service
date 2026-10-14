@@ -23,6 +23,14 @@ export interface ConsumeRequestRow {
   created_at: Date;
 }
 
+interface UserWithPlans {
+  id: number;
+  account_monthly_limit: number;
+  account_max_units_per_request: number;
+  user_monthly_limit: number;
+  user_max_units_per_request: number;
+}
+
 export function toRequestRecord(row: ConsumeRequestRow, userId: string) {
   return {
     requestId: row.request_id,
@@ -40,43 +48,47 @@ function toDecisionResponse(row: ConsumeRequestRow, userId: string, replayed: bo
   return { ...toRequestRecord(row, userId), replayed };
 }
 
-// The row has to exist before FOR UPDATE can lock it.
-async function lockAccountUsage(client: PoolClient, accountId: number, month: string): Promise<number> {
-  await client.query(
-    'INSERT INTO account_usage (account_id, month) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-    [accountId, month],
-  );
-  const result = await client.query<{ used: number }>(
-    'SELECT used FROM account_usage WHERE account_id = $1 AND month = $2 FOR UPDATE',
-    [accountId, month],
-  );
+// Locks the usage row and returns `used`. Only the first request of the month has to create the row,
+// because FOR UPDATE can't lock a row that doesn't exist yet.
+async function lockUsageRow(client: PoolClient, table: 'account_usage' | 'user_usage', column: 'account_id' | 'user_id', id: number, month: string) {
+  const select = `SELECT used FROM ${table} WHERE ${column} = $1 AND month = $2 FOR UPDATE`;
+  let result = await client.query<{ used: number }>(select, [id, month]);
+  if (result.rowCount === 0) {
+    await client.query(`INSERT INTO ${table} (${column}, month) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [id, month]);
+    result = await client.query<{ used: number }>(select, [id, month]);
+  }
   return result.rows[0].used;
 }
 
-async function lockUserUsage(client: PoolClient, userDbId: number, month: string): Promise<number> {
-  await client.query(
-    'INSERT INTO user_usage (user_id, month) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-    [userDbId, month],
-  );
-  const result = await client.query<{ used: number }>(
-    'SELECT used FROM user_usage WHERE user_id = $1 AND month = $2 FOR UPDATE',
-    [userDbId, month],
-  );
-  return result.rows[0].used;
+function lockAccountUsage(client: PoolClient, accountId: number, month: string) {
+  return lockUsageRow(client, 'account_usage', 'account_id', accountId, month);
+}
+
+function lockUserUsage(client: PoolClient, userDbId: number, month: string) {
+  return lockUsageRow(client, 'user_usage', 'user_id', userDbId, month);
 }
 
 export async function consume(accountId: number, input: ConsumeInput, now: Date = new Date()) {
   const month = currentMonth(now);
 
   return withTransaction(async (client) => {
-    const userResult = await client.query<{ id: number }>(
-      'SELECT id FROM users WHERE account_id = $1 AND external_id = $2',
+    const userResult = await client.query<UserWithPlans>(
+      `SELECT u.id,
+              ap.monthly_limit         AS account_monthly_limit,
+              ap.max_units_per_request AS account_max_units_per_request,
+              up.monthly_limit         AS user_monthly_limit,
+              up.max_units_per_request AS user_max_units_per_request
+       FROM users u
+       JOIN accounts a ON a.id = u.account_id
+       JOIN plans ap   ON ap.id = a.plan_id
+       JOIN plans up   ON up.id = u.plan_id
+       WHERE u.account_id = $1 AND u.external_id = $2`,
       [accountId, input.userId],
     );
     if (userResult.rowCount === 0) {
       throw new HttpError(404, 'user_not_found', `User ${input.userId} not found`);
     }
-    const userDbId = userResult.rows[0].id;
+    const p = userResult.rows[0];
 
     // Always lock the account row before the user row, so transactions can't deadlock.
     const accountUsed = await lockAccountUsage(client, accountId, month);
@@ -89,32 +101,14 @@ export async function consume(accountId: number, input: ConsumeInput, now: Date 
     );
     if (previous.rowCount) {
       const original = previous.rows[0];
-      if (original.user_id !== userDbId || original.units !== input.units) {
+      if (original.user_id !== p.id || original.units !== input.units) {
         throw new HttpError(409, 'request_id_conflict', `requestId ${input.requestId} was already used for a different request`);
       }
       return toDecisionResponse(original, input.userId, true);
     }
 
-    const userUsed = await lockUserUsage(client, userDbId, month);
+    const userUsed = await lockUserUsage(client, p.id, month);
 
-    const plans = await client.query<{
-      account_monthly_limit: number;
-      account_max_units_per_request: number;
-      user_monthly_limit: number;
-      user_max_units_per_request: number;
-    }>(
-      `SELECT ap.monthly_limit         AS account_monthly_limit,
-              ap.max_units_per_request AS account_max_units_per_request,
-              up.monthly_limit         AS user_monthly_limit,
-              up.max_units_per_request AS user_max_units_per_request
-       FROM users u
-       JOIN accounts a ON a.id = u.account_id
-       JOIN plans ap   ON ap.id = a.plan_id
-       JOIN plans up   ON up.id = u.plan_id
-       WHERE u.id = $1`,
-      [userDbId],
-    );
-    const p = plans.rows[0];
     const account = { monthlyLimit: p.account_monthly_limit, maxUnitsPerRequest: p.account_max_units_per_request, used: accountUsed };
     const user = { monthlyLimit: p.user_monthly_limit, maxUnitsPerRequest: p.user_max_units_per_request, used: userUsed };
 
@@ -129,7 +123,7 @@ export async function consume(accountId: number, input: ConsumeInput, now: Date 
       );
       await client.query(
         'UPDATE user_usage SET used = used + $1 WHERE user_id = $2 AND month = $3',
-        [input.units, userDbId, month],
+        [input.units, p.id, month],
       );
     }
 
@@ -141,7 +135,7 @@ export async function consume(accountId: number, input: ConsumeInput, now: Date 
        RETURNING *`,
       [
         accountId,
-        userDbId,
+        p.id,
         input.requestId,
         input.units,
         month,

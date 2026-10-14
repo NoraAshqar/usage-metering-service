@@ -225,8 +225,10 @@ both levels. Previous months stay in the database.
 
 ## Plan changes
 
-- `consume` reads the account plan and the user plan **on every request**. A plan update or a
-  plan switch applies to the next request after it succeeds, with no restart.
+- `consume` reads the account plan and the user plan **at the start of every request**. A plan
+  update or a plan switch applies to every request that starts after it succeeds, with no restart.
+  A request that was already waiting for the account lock when the change happened is decided
+  with the plans it read when it started.
 - Switching plans keeps the units already used this month: there is no fresh allowance.
 - If a monthly limit is lowered below what was already used, `remaining` is shown as `0`
   (never negative) and further requests are rejected at that level.
@@ -250,11 +252,12 @@ send a new `requestId`. Every `requestId` belongs to one account, so two account
 
 `consume` runs in one database transaction:
 
-1. Find the user inside the calling account (`404` otherwise).
-2. Create this month's `account_usage` row if it is missing, then **lock** it (`SELECT ... FOR UPDATE`).
+1. Find the user inside the calling account together with both current plans (`404` otherwise).
+2. **Lock** this month's `account_usage` row (`SELECT ... FOR UPDATE`). On the first request of
+   the month the row doesn't exist yet, so it is created first (`INSERT ... ON CONFLICT DO NOTHING`).
 3. Look for an earlier request with the same `requestId` and return it if there is one.
-4. Create and lock the user's `user_usage` row.
-5. Read both current plans and evaluate the rules (`rules.ts`, a pure function).
+4. Lock the user's `user_usage` row the same way.
+5. Evaluate the rules (`rules.ts`, a pure function).
 6. If accepted, add the units to both counters.
 7. Save the decision in `consume_requests` and commit.
 
@@ -270,6 +273,99 @@ finds the first one's saved decision.
 accepted and that the counters match the request history. As a check of the test itself, we
 removed `FOR UPDATE` and ran it again: 27 of the 50 requests were accepted (270 units for a
 100-unit allowance), so the test does catch the race.
+
+## Performance
+
+### How it was tested
+
+`load-test/run.js` uses [autocannon](https://github.com/mcollina/autocannon) to send
+`POST /consume` requests with 50 concurrent connections, 20 seconds per scenario. It runs in a
+container on the same Docker network as the service, so it needs nothing installed but Docker:
+
+```bash
+docker compose up --build -d
+LABEL=my-run docker compose --profile loadtest run --rm --build loadtest
+```
+
+`DURATION` and `CONNECTIONS` can be set the same way as `LABEL`. The report is printed and saved to
+`load-test/results/<LABEL>.md`.
+
+| Scenario | Setup | What it measures |
+|---|---|---|
+| `spread` | 20 accounts × 5 users, 1-10 units | throughput when requests rarely wait for each other |
+| `hot-account` | 1 account × 50 users, 1-10 units | every request waits for the same account lock |
+| `limit-reached` | 1 account with 5,000 units, 10 units per request | correctness when the limit is hit under load |
+
+After each scenario the script checks in SQL, for every account it used:
+
+- the account counter equals the sum of accepted units in `consume_requests`,
+- the sum of the user counters equals the account counter,
+- the account never went over its monthly limit,
+- every `2xx` response has a stored decision.
+
+All checks passed in every run. In `limit-reached` exactly 500 requests were accepted, i.e.
+exactly the 5,000-unit limit, and the rest were rejected by the account plan.
+
+### Results
+
+Machine: laptop with an Intel Core i5-1235U and 8 GB RAM, Windows 11, Docker Desktop (WSL 2,
+12 CPUs, 3.7 GB RAM for Docker). The load generator, the service and Postgres all run on the
+same machine, so the numbers are only useful for comparing versions, not as absolute capacity.
+
+Single runs on this laptop varied by up to ±20%, so the two versions were run alternately three
+times (old, new, old, new, old, new). The table shows the median of the three runs; every run
+is in `load-test/results/ab-*.md`.
+
+| Scenario | Requests/s before | Requests/s after | p50 before | p50 after | p99 before | p99 after |
+|---|---:|---:|---:|---:|---:|---:|
+| spread | 269 | 283 (+5%) | 174 ms | 154 ms | 342 ms | 567 ms |
+| hot-account | 120 | 152 (+27%) | 377 ms | 347 ms | 832 ms | 547 ms |
+| limit-reached | 147 | 202 (+37%) | 318 ms | 219 ms | 593 ms | 517 ms |
+
+No run had errors or non-`2xx` responses.
+
+### What we found and changed
+
+**1. The Node process was the first bottleneck.** During the first runs, the service container
+used ~100% CPU (one full core: Node runs JavaScript on one thread) while Postgres used ~240% of
+12 CPUs, and most database connections were idle waiting for the service (`ClientRead`).
+Every query costs CPU in Node and a network round trip, so the fix was to send fewer queries:
+
+| Database round trips per `/consume` | Before | After |
+|---|---:|---:|
+| accepted request | 13 | 8 |
+| rejected request | 11 | 6 |
+| while holding the account lock | 8 | 6 |
+
+- The API key lookup is cached in memory. Keys can't change and accounts can't be deleted, so a
+  cached key can't become wrong.
+- The user and both plans are read in one query.
+- The usage rows are locked with a single `SELECT ... FOR UPDATE`. The `INSERT` that creates the
+  row is only needed for the first request of the month.
+
+**2. The account lock limits one account's throughput.** All requests of the same account wait
+for each other at the account row, so one account can only go as fast as one transaction after
+another: `hot-account` is about half of `spread`. This is the price of exact totals. Reading the
+plans before taking the lock shortened the time each request holds it, which is why
+`hot-account` and `limit-reached` gained the most.
+
+**3. An idea that made it worse.** We first replaced `INSERT` + `SELECT ... FOR UPDATE` with one
+`INSERT ... ON CONFLICT DO UPDATE SET used = used RETURNING used`. It is one statement instead
+of two, but it writes a new version of the row on every request. On a single hot row this made
+`limit-reached` slower (109 instead of ~160 requests/s) and doubled the p99, so it was replaced
+by the `SELECT ... FOR UPDATE` fast path.
+
+**4. `spread` barely changed.** The difference between the versions (+5%) is smaller than the
+noise between runs, and its p99 got worse in two of three runs. With requests spread over many
+accounts, the limit is the single Node process and the shared laptop CPU, not the queries.
+
+### Possible next steps
+
+- Run several service processes (Node cluster or more containers). Correctness does not depend
+  on the service process, only on the database locks, so this needs no code change.
+- Put the counter updates and the history insert into one statement to shorten the lock further.
+- For a very hot account: give up exact real-time totals, e.g. reserve units in batches per
+  process. That would trade accuracy for throughput, so it is not done here.
 
 ## Product assumptions
 
@@ -291,7 +387,6 @@ removed `FOR UPDATE` and ran it again: 27 of the 50 requests were accepted (270 
   `maxUnitsPerRequest` must be at least 1.
 - **Plans cannot be deleted.** Deleting a plan that is assigned, or that past requests were
   decided under, would need extra rules; it is not required, so it is left out.
-
 - **A rejection is a normal answer** (`200` with `accepted: false`), not an HTTP error, so the
   caller can tell "not allowed by the plan" apart from "your request was wrong".
 - **Rejected requests are stored** in the history too, so a caller can see why an action failed.
@@ -306,5 +401,4 @@ removed `FOR UPDATE` and ran it again: 27 of the 50 requests were accepted (270 
 
 ## TODO
 - Design decisions
-- Performance results
 - Known limitations
