@@ -15,6 +15,44 @@ On startup the service applies any new SQL files from `service/migrations/` (sch
 plans) and records them in the `schema_migrations` table, so restarts keep all data.
 Schema changes are added as new numbered files. To wipe all data: `docker compose down -v`.
 
+## Demo client
+
+`client/` is a small command-line app that plays a document processing company. It uses only
+the public API with its own API key, and runs automatically with `docker compose up --build`.
+Its output is in the `client` logs:
+
+```bash
+docker compose logs client        # output of the run during startup
+docker compose run --rm client    # run it again (every run creates a new account)
+```
+
+To run it outside Docker (the service must be running on port 3000):
+
+```bash
+cd client
+npm install
+npm run build
+npm start
+```
+
+What it shows:
+
+| Step | What happens | Result |
+|---|---|---|
+| Setup | Account on a custom plan "Small Team" (300/month, 100/request); alice on Basic, bob on Premium | |
+| 1 | alice, 10 units | accepted |
+| 2 | alice, 25 units | rejected by the **user** plan (`max_units_per_request`) |
+| 3 | bob, 3 × 100 units | the third is rejected by the **account** plan (`monthly_limit`), although bob has 4,800 left |
+| 4 | alice is switched to Premium and sends 25 units again | accepted |
+| 5 | the account plan is raised to 1,000/month and bob sends 100 units again | accepted |
+| 6 | the request from step 1 is sent again with the same `requestId` | original decision, nothing charged again |
+| Summary | `GET /usage` | table of used / limit / remaining per account and user |
+
+Steps 4 and 5 change what users can do through the API only: the client code stays the same.
+
+Configuration (environment variables): `SERVICE_URL` (default `http://localhost:3000`) and
+`ADMIN_KEY` (default `admin-secret`).
+
 ## Predefined plans
 
 | Plan    | Level   | Monthly allowance | Max units / request |
