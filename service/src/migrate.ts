@@ -2,12 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { pool, withTransaction } from './db';
 
-// Folder with numbered .sql files: 001_schema.sql, 002_seed_plans.sql, ...
 const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
 
-// Applies every .sql file that was not applied before, in name order.
-// Each file runs in its own transaction: it is applied completely or not at all.
-// To change the schema later, add a NEW file (e.g. 003_add_column.sql) - never edit an applied one.
 export async function runMigrations() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (

@@ -136,7 +136,6 @@ describe('plan isolation', () => {
     assert.equal(assign.status, 400);
     assert.equal(assign.body.error.code, 'invalid_plan');
 
-    // The owner's plan was not changed.
     const ownerView = await request(app).get(`/plans/${plan.id}`).set('x-api-key', owner.apiKey);
     assert.equal(ownerView.body.monthlyLimit, 2000);
   });

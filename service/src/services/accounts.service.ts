@@ -18,7 +18,6 @@ function toAccountResponse(account: AccountRow, plan: PlanRow) {
   };
 }
 
-// Creates an account and returns its API key. This is the only time the raw key is visible.
 export async function createAccount(name: string, planId?: number) {
   const plan = await resolveAssignablePlan(null, 'account', planId);
   const apiKey = generateApiKey();
@@ -40,7 +39,6 @@ export async function getAccount(accountId: number) {
   return toAccountResponse(account, await getPlan(account.plan_id));
 }
 
-// Switching plans does not touch usage: units already used this month still count.
 export async function changeAccountPlan(accountId: number, planId: number) {
   const plan = await resolveAssignablePlan(accountId, 'account', planId);
   await pool.query('UPDATE accounts SET plan_id = $1 WHERE id = $2', [plan.id, accountId]);

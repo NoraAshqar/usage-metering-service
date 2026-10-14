@@ -1,20 +1,12 @@
--- ============================================================
--- Usage Metering and Quota Service - database schema
--- Applied once by src/migrate.ts when the service starts.
--- ============================================================
-
--- An application/company that calls our service.
 CREATE TABLE accounts (
   id           SERIAL PRIMARY KEY,
   name         TEXT NOT NULL,
-  api_key_hash TEXT NOT NULL UNIQUE,          -- sha256 of the API key (we never store the raw key)
-  plan_id      INT  NOT NULL,                 -- FK added below (plans references accounts too)
+  api_key_hash TEXT NOT NULL UNIQUE,
+  plan_id      INT  NOT NULL,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- A plan = a named set of rules. account_id NULL means "predefined" (read-only, shared by everyone).
--- NOTE: "an account may only use predefined plans or its own plans, with the right scope"
---       is checked in the service layer (see routes), not here.
+-- account_id NULL = predefined plan
 CREATE TABLE plans (
   id                    SERIAL PRIMARY KEY,
   account_id            INT REFERENCES accounts(id),
@@ -26,27 +18,22 @@ CREATE TABLE plans (
   updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Plan names are unique per owner and scope (one index for predefined plans, one for custom plans,
--- because NULL is never equal to NULL in a normal UNIQUE constraint).
 CREATE UNIQUE INDEX plans_predefined_name_unique ON plans (name, scope) WHERE account_id IS NULL;
 CREATE UNIQUE INDEX plans_custom_name_unique ON plans (account_id, name, scope) WHERE account_id IS NOT NULL;
 
 ALTER TABLE accounts
   ADD CONSTRAINT accounts_plan_fk FOREIGN KEY (plan_id) REFERENCES plans(id);
 
--- A user of the calling application. external_id is the id the application uses for them.
 CREATE TABLE users (
   id          SERIAL PRIMARY KEY,
   account_id  INT  NOT NULL REFERENCES accounts(id),
   external_id TEXT NOT NULL,
   plan_id     INT  NOT NULL REFERENCES plans(id),
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (account_id, external_id),           -- same external_id may exist in two different accounts
-  UNIQUE (id, account_id)                     -- needed so consume_requests can reference (user_id, account_id)
+  UNIQUE (account_id, external_id),
+  UNIQUE (id, account_id)
 );
 
--- Usage counters: one row per (account, month) and per (user, month).
--- month = first day of the UTC month, e.g. 2026-10-01.
 CREATE TABLE account_usage (
   account_id INT  NOT NULL REFERENCES accounts(id),
   month      DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1),
@@ -61,23 +48,21 @@ CREATE TABLE user_usage (
   PRIMARY KEY (user_id, month)
 );
 
--- Every consume request and its decision (accepted or rejected). Never updated, only inserted.
 CREATE TABLE consume_requests (
   id                BIGSERIAL PRIMARY KEY,
   account_id        INT  NOT NULL REFERENCES accounts(id),
   user_id           INT  NOT NULL,
-  request_id        TEXT NOT NULL,              -- supplied by the caller, used for safe retries
+  request_id        TEXT NOT NULL,
   units             INT  NOT NULL CHECK (units > 0),
   month             DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1),
   accepted          BOOLEAN NOT NULL,
   rejected_level    TEXT CHECK (rejected_level IN ('account', 'user')),
   rejected_rule     TEXT CHECK (rejected_rule IN ('monthly_limit', 'max_units_per_request')),
-  account_remaining INT  NOT NULL CHECK (account_remaining >= 0),  -- remaining after this decision
+  account_remaining INT  NOT NULL CHECK (account_remaining >= 0),
   user_remaining    INT  NOT NULL CHECK (user_remaining >= 0),
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (account_id, request_id),              -- a retry with the same request_id is detected here
-  FOREIGN KEY (user_id, account_id) REFERENCES users (id, account_id),  -- user must belong to this account
-  -- accepted => no reason; rejected => exactly one reason (level + rule)
+  UNIQUE (account_id, request_id),
+  FOREIGN KEY (user_id, account_id) REFERENCES users (id, account_id),
   CHECK (
     (accepted AND rejected_level IS NULL AND rejected_rule IS NULL)
     OR (NOT accepted AND rejected_level IS NOT NULL AND rejected_rule IS NOT NULL)

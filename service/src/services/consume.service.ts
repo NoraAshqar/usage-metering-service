@@ -5,7 +5,7 @@ import { currentMonth } from '../utils/month';
 import { Level, Rule, evaluate, remaining } from './rules';
 
 export interface ConsumeInput {
-  userId: string; // the calling application's user id (users.external_id)
+  userId: string;
   units: number;
   requestId: string;
 }
@@ -14,7 +14,7 @@ export interface ConsumeRequestRow {
   user_id: number;
   request_id: string;
   units: number;
-  month: string; // '2026-10-01'
+  month: string;
   accepted: boolean;
   rejected_level: Level | null;
   rejected_rule: Rule | null;
@@ -23,7 +23,6 @@ export interface ConsumeRequestRow {
   created_at: Date;
 }
 
-// One stored decision, as returned by /consume and by the request history (/requests).
 export function toRequestRecord(row: ConsumeRequestRow, userId: string) {
   return {
     requestId: row.request_id,
@@ -31,19 +30,17 @@ export function toRequestRecord(row: ConsumeRequestRow, userId: string) {
     units: row.units,
     accepted: row.accepted,
     rejectedBy: row.accepted ? null : { level: row.rejected_level, rule: row.rejected_rule },
-    month: row.month.slice(0, 7), // '2026-10'
-    remaining: { account: row.account_remaining, user: row.user_remaining }, // at decision time
+    month: row.month.slice(0, 7),
+    remaining: { account: row.account_remaining, user: row.user_remaining },
     decidedAt: row.created_at,
   };
 }
 
 function toDecisionResponse(row: ConsumeRequestRow, userId: string, replayed: boolean) {
-  // replayed: true = this is a retry; the stored decision is returned and nothing new is consumed
   return { ...toRequestRecord(row, userId), replayed };
 }
 
-// Locks this month's usage row (creating it first if needed) and returns `used`.
-// FOR UPDATE cannot lock a row that does not exist yet, so the INSERT ... ON CONFLICT comes first.
+// The row has to exist before FOR UPDATE can lock it.
 async function lockAccountUsage(client: PoolClient, accountId: number, month: string): Promise<number> {
   await client.query(
     'INSERT INTO account_usage (account_id, month) VALUES ($1, $2) ON CONFLICT DO NOTHING',
@@ -68,14 +65,10 @@ async function lockUserUsage(client: PoolClient, userDbId: number, month: string
   return result.rows[0].used;
 }
 
-// Decides one consume request. Everything runs in ONE transaction:
-// either the decision AND the usage update are both saved, or nothing is.
-// `now` can be passed by tests to simulate another month.
 export async function consume(accountId: number, input: ConsumeInput, now: Date = new Date()) {
   const month = currentMonth(now);
 
   return withTransaction(async (client) => {
-    // 1. The user must belong to the calling account.
     const userResult = await client.query<{ id: number }>(
       'SELECT id FROM users WHERE account_id = $1 AND external_id = $2',
       [accountId, input.userId],
@@ -85,12 +78,11 @@ export async function consume(accountId: number, input: ConsumeInput, now: Date 
     }
     const userDbId = userResult.rows[0].id;
 
-    // 2. Lock the ACCOUNT row first. All requests of this account now run one after another here.
-    //    Always account first, then user: the same order everywhere means no deadlocks.
+    // Always lock the account row before the user row, so transactions can't deadlock.
     const accountUsed = await lockAccountUsage(client, accountId, month);
 
-    // 3. Retry check - AFTER the lock. If the same requestId is sent twice at the same moment,
-    //    the second one waits at step 2 and then sees the row the first one saved.
+    // Checked after the lock: a concurrent request with the same requestId waits above,
+    // then finds the decision saved by the first one.
     const previous = await client.query<ConsumeRequestRow>(
       'SELECT * FROM consume_requests WHERE account_id = $1 AND request_id = $2',
       [accountId, input.requestId],
@@ -100,13 +92,11 @@ export async function consume(accountId: number, input: ConsumeInput, now: Date 
       if (original.user_id !== userDbId || original.units !== input.units) {
         throw new HttpError(409, 'request_id_conflict', `requestId ${input.requestId} was already used for a different request`);
       }
-      return toDecisionResponse(original, input.userId, true); // the original decision, not re-evaluated
+      return toDecisionResponse(original, input.userId, true);
     }
 
-    // 4. Lock the USER row.
     const userUsed = await lockUserUsage(client, userDbId, month);
 
-    // 5. Read the CURRENT plans. A plan change committed before this point applies to this request.
     const plans = await client.query<{
       account_monthly_limit: number;
       account_max_units_per_request: number;
@@ -128,10 +118,8 @@ export async function consume(accountId: number, input: ConsumeInput, now: Date 
     const account = { monthlyLimit: p.account_monthly_limit, maxUnitsPerRequest: p.account_max_units_per_request, used: accountUsed };
     const user = { monthlyLimit: p.user_monthly_limit, maxUnitsPerRequest: p.user_max_units_per_request, used: userUsed };
 
-    // 6. Apply both plans' rules (pure function, see rules.ts).
     const decision = evaluate(input.units, account, user);
 
-    // 7. Count the usage - only if accepted. A rejection consumes nothing.
     if (decision.accepted) {
       account.used += input.units;
       user.used += input.units;
@@ -145,7 +133,6 @@ export async function consume(accountId: number, input: ConsumeInput, now: Date 
       );
     }
 
-    // 8. Save the decision (accepted or rejected) in the request history.
     const saved = await client.query<ConsumeRequestRow>(
       `INSERT INTO consume_requests
          (account_id, user_id, request_id, units, month, accepted, rejected_level, rejected_rule,

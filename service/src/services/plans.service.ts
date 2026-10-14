@@ -6,14 +6,13 @@ export type PlanScope = (typeof PLAN_SCOPES)[number];
 
 export interface PlanRow {
   id: number;
-  account_id: number | null; // null = predefined plan
+  account_id: number | null; // null = predefined
   name: string;
   scope: PlanScope;
   monthly_limit: number;
   max_units_per_request: number;
 }
 
-// The plan shape we return in the API (camelCase, no internal columns).
 export function toPlanResponse(plan: PlanRow) {
   return {
     id: plan.id,
@@ -25,7 +24,6 @@ export function toPlanResponse(plan: PlanRow) {
   };
 }
 
-// Used when no planId is given while creating an account or a user.
 const DEFAULT_PLAN_NAME: Record<PlanScope, string> = { account: 'Starter', user: 'Basic' };
 
 export async function getPlan(planId: number): Promise<PlanRow> {
@@ -33,11 +31,7 @@ export async function getPlan(planId: number): Promise<PlanRow> {
   return result.rows[0];
 }
 
-// Returns the plan only if it may be assigned at this level:
-//   - the scope matches ('account' plans for accounts, 'user' plans for users), and
-//   - it is predefined OR it belongs to this account.
-// accountId is null while an account is being created, so only predefined plans match.
-// Another account's plan gives the same error as a missing plan, so nothing leaks between accounts.
+// accountId is null while creating an account, so only predefined plans can match.
 export async function resolveAssignablePlan(
   accountId: number | null,
   scope: PlanScope,
@@ -60,10 +54,6 @@ export async function resolveAssignablePlan(
   return result.rows[0];
 }
 
-// ---------------------------------------------------------------------------
-// Plans API: an account sees the predefined plans and its own custom plans.
-// ---------------------------------------------------------------------------
-
 export async function listPlans(accountId: number) {
   const result = await pool.query<PlanRow>(
     'SELECT * FROM plans WHERE account_id IS NULL OR account_id = $1 ORDER BY account_id NULLS FIRST, id',
@@ -72,7 +62,6 @@ export async function listPlans(accountId: number) {
   return result.rows.map(toPlanResponse);
 }
 
-// Another account's plan is "not found", like a plan that does not exist.
 async function findVisiblePlan(accountId: number, planId: number): Promise<PlanRow> {
   const result = await pool.query<PlanRow>(
     'SELECT * FROM plans WHERE id = $1 AND (account_id IS NULL OR account_id = $2)',
@@ -120,9 +109,6 @@ export interface PlanChanges {
   maxUnitsPerRequest?: number;
 }
 
-// Updates a custom plan in place. Every account/user assigned to it gets the new limits
-// on their NEXT consume request (consume always reads the current plan).
-// Usage and request history are not touched. The scope can't change, so assignments stay valid.
 export async function updatePlan(accountId: number, planId: number, changes: PlanChanges) {
   const plan = await findVisiblePlan(accountId, planId);
   if (plan.account_id === null) {
@@ -130,7 +116,6 @@ export async function updatePlan(accountId: number, planId: number, changes: Pla
   }
 
   try {
-    // COALESCE(new, old): a field that was not sent (null) keeps its current value.
     const result = await pool.query<PlanRow>(
       `UPDATE plans SET
          name                  = COALESCE($1, name),

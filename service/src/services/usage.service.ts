@@ -4,7 +4,6 @@ import { ConsumeRequestRow, toRequestRecord } from './consume.service';
 import { remaining } from './rules';
 import { findUser } from './users.service';
 
-// One level (account or user) in one month: used units + the plan's allowance.
 interface UsageRow {
   used: number;
   plan_id: number;
@@ -12,8 +11,6 @@ interface UsageRow {
   monthly_limit: number;
 }
 
-// Plans are not versioned: monthlyLimit/remaining always use the CURRENT plan, also for past months.
-// (The remaining value at the time of each decision is kept in the request history.)
 function toUsage(row: UsageRow) {
   return {
     used: row.used,
@@ -23,7 +20,6 @@ function toUsage(row: UsageRow) {
   };
 }
 
-// Asks the database for limit + 1 rows: if the extra row exists, there is a next page.
 function toPage<T>(rows: T[], page: Page) {
   return {
     items: rows.slice(0, page.limit),
@@ -31,7 +27,6 @@ function toPage<T>(rows: T[], page: Page) {
   };
 }
 
-// No usage row for a month simply means nothing was used: LEFT JOIN + COALESCE(used, 0).
 async function accountUsage(accountId: number, month: string) {
   const result = await pool.query<UsageRow>(
     `SELECT COALESCE(au.used, 0) AS used, p.id AS plan_id, p.name AS plan_name, p.monthly_limit
@@ -56,7 +51,6 @@ async function userUsage(userDbId: number, month: string) {
   return toUsage(result.rows[0]);
 }
 
-// GET /usage: the account's usage and one page of its users' usage (users without usage show 0).
 export async function getAccountUsage(accountId: number, month: string, page: Page) {
   const users = await pool.query<UsageRow & { external_id: string }>(
     `SELECT u.external_id, COALESCE(uu.used, 0) AS used, p.id AS plan_id, p.name AS plan_name, p.monthly_limit
@@ -78,7 +72,6 @@ export async function getAccountUsage(accountId: number, month: string, page: Pa
   };
 }
 
-// GET /users/:userId/usage: the user's usage and the account's, since both limit what the user can do.
 export async function getUserUsage(accountId: number, userId: string, month: string) {
   const user = await findUser(accountId, userId);
   return {
@@ -94,8 +87,6 @@ export interface HistoryFilter {
   month?: string;
 }
 
-// GET /requests: accepted and rejected decisions, newest first.
-// A filter that is not given is passed as NULL, and "$n IS NULL OR ..." then matches every row.
 export async function getRequestHistory(accountId: number, filter: HistoryFilter, page: Page) {
   const userDbId = filter.userId ? (await findUser(accountId, filter.userId)).id : null;
 

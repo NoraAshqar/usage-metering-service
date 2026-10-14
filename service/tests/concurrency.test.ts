@@ -6,11 +6,6 @@ import { closeDatabase, consumeUnits, newRequestId, setupAccount, setupDatabase 
 before(setupDatabase);
 after(closeDatabase);
 
-// All requests in these tests are sent at the same time (Promise.all), so they compete
-// for the same rows in the database. Without the row locks, several of them would read the
-// same `used` value and the limit would be exceeded.
-
-// Checks that the stored counters match the accepted requests in the history.
 async function assertTotalsMatchHistory(accountId: number) {
   const usage = await pool.query('SELECT COALESCE(SUM(used), 0)::int AS used FROM account_usage WHERE account_id = $1', [accountId]);
   const users = await pool.query(
@@ -37,7 +32,7 @@ describe('concurrency', () => {
 
     const accepted = responses.filter((r) => r.body.accepted);
     assert.ok(responses.every((r) => r.status === 200));
-    assert.equal(accepted.length, 10); // 10 x 10 = exactly the 100 allowed
+    assert.equal(accepted.length, 10);
     assert.equal(await assertTotalsMatchHistory(accountId), 100);
   });
 
@@ -54,7 +49,7 @@ describe('concurrency', () => {
 
     const accepted = responses.filter((r) => r.body.accepted);
     const rejected = responses.filter((r) => !r.body.accepted);
-    assert.equal(accepted.length, 20); // 20 x 5 = exactly the 100 allowed
+    assert.equal(accepted.length, 20);
     assert.ok(rejected.every((r) => r.body.rejectedBy.level === 'account'));
     assert.equal(await assertTotalsMatchHistory(accountId), 100);
   });
@@ -69,7 +64,7 @@ describe('concurrency', () => {
     const responses = await Promise.all(Array.from({ length: 10 }, () => consumeUnits(apiKey, 'alice', 10, requestId)));
 
     assert.ok(responses.every((r) => r.status === 200 && r.body.accepted));
-    assert.equal(responses.filter((r) => !r.body.replayed).length, 1); // one original, nine retries
+    assert.equal(responses.filter((r) => !r.body.replayed).length, 1);
     assert.equal(await assertTotalsMatchHistory(accountId), 10);
   });
 });

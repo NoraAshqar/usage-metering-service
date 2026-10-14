@@ -13,21 +13,17 @@ import {
   requireString,
 } from '../utils/validation';
 
-// Mounted at /plans.
 export const plansRouter = Router();
 
-// GET /plans  ->  { plans: [...] }  predefined plans first, then my custom plans
 plansRouter.get('/', async (_req, res) => {
   res.json({ plans: await listPlans(accountIdOf(res)) });
 });
 
-// GET /plans/:planId  ->  one plan (predefined or mine)
 plansRouter.get('/:planId', async (req, res) => {
   const planId = requireIdParam(req.params.planId, 'planId');
   res.json(await getVisiblePlan(accountIdOf(res), planId));
 });
 
-// POST /plans  { name, scope, monthlyLimit, maxUnitsPerRequest }  ->  201 the new custom plan
 plansRouter.post('/', async (req, res) => {
   const body = req.body ?? {};
   const plan = {
@@ -39,7 +35,6 @@ plansRouter.post('/', async (req, res) => {
   res.status(201).json(await createPlan(accountIdOf(res), plan));
 });
 
-// PATCH /plans/:planId  { name?, monthlyLimit?, maxUnitsPerRequest? }  ->  the updated plan
 plansRouter.patch('/:planId', async (req, res) => {
   const planId = requireIdParam(req.params.planId, 'planId');
   const body = req.body ?? {};

@@ -4,9 +4,6 @@ import { config } from '../src/config';
 import { pool } from '../src/db';
 import { runMigrations } from '../src/migrate';
 
-// Tests run against the Postgres started by docker compose (localhost:5432).
-// Every test creates its own accounts, so tests never see each other's data.
-
 export const app = createApp();
 
 export async function setupDatabase() {
@@ -17,7 +14,6 @@ export async function closeDatabase() {
   await pool.end();
 }
 
-// Creates a fresh account through the API and returns its API key.
 export async function createTestAccount(planId?: number): Promise<{ apiKey: string; accountId: number }> {
   const res = await request(app)
     .post('/admin/accounts')
@@ -31,7 +27,6 @@ export async function predefinedPlanId(name: string): Promise<number> {
   return result.rows[0].id;
 }
 
-// Creates a custom plan and returns its id.
 export async function createPlan(
   apiKey: string,
   scope: 'account' | 'user',
@@ -45,7 +40,6 @@ export async function createPlan(
   return res.body.id;
 }
 
-// An account on its own account plan, with one user per given user plan id.
 export async function setupAccount(
   accountPlan: { monthlyLimit: number; maxUnitsPerRequest: number },
   users: Record<string, { monthlyLimit: number; maxUnitsPerRequest: number }>,

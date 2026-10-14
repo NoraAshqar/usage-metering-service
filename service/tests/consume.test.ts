@@ -15,7 +15,6 @@ import {
 before(setupDatabase);
 after(closeDatabase);
 
-// The example from the brief.
 const accountPlan = { monthlyLimit: 10_000, maxUnitsPerRequest: 100 };
 const userPlan = { monthlyLimit: 1_000, maxUnitsPerRequest: 20 };
 
@@ -38,7 +37,7 @@ describe('consume: the examples from the brief', () => {
     assert.equal(res.status, 200);
     assert.equal(res.body.accepted, false);
     assert.deepEqual(res.body.rejectedBy, { level: 'user', rule: 'max_units_per_request' });
-    assert.deepEqual(res.body.remaining, { account: 10_000, user: 1_000 }); // nothing consumed
+    assert.deepEqual(res.body.remaining, { account: 10_000, user: 1_000 });
   });
 
   it('rejects 10 units when the account has only 5 left, even if the user has plenty', async () => {
@@ -46,7 +45,7 @@ describe('consume: the examples from the brief', () => {
       { monthlyLimit: 15, maxUnitsPerRequest: 100 },
       { alice: userPlan, bob: userPlan },
     );
-    await consumeUnits(apiKey, 'alice', 10); // account: 5 left
+    await consumeUnits(apiKey, 'alice', 10);
 
     const res = await consumeUnits(apiKey, 'bob', 10);
     assert.equal(res.body.accepted, false);
@@ -106,7 +105,7 @@ describe('consume: plan changes', () => {
   it('switching plans keeps the units already used (no fresh allowance)', async () => {
     const { apiKey } = await setupAccount(accountPlan, {
       alice: { monthlyLimit: 30, maxUnitsPerRequest: 20 },
-      bigger: { monthlyLimit: 40, maxUnitsPerRequest: 20 }, // only used for its plan
+      bigger: { monthlyLimit: 40, maxUnitsPerRequest: 20 },
     });
     await consumeUnits(apiKey, 'alice', 20);
 
@@ -114,7 +113,7 @@ describe('consume: plan changes', () => {
     await request(app).put('/users/alice/plan').set('x-api-key', apiKey).send({ planId: biggerPlanId });
 
     const res = await consumeUnits(apiKey, 'alice', 5);
-    assert.equal(res.body.remaining.user, 40 - 25); // 20 used before the switch still count
+    assert.equal(res.body.remaining.user, 40 - 25);
   });
 
   it('a limit reduced below usage shows 0 remaining and rejects further requests', async () => {
@@ -143,7 +142,7 @@ describe('consume: retries (requestId)', () => {
     assert.deepEqual(retry.body.remaining, first.body.remaining);
 
     const next = await consumeUnits(apiKey, 'alice', 1);
-    assert.deepEqual(next.body.remaining, { account: 9_989, user: 989 }); // 10 counted once
+    assert.deepEqual(next.body.remaining, { account: 9_989, user: 989 });
   });
 
   it('a retried rejection stays rejected, even after the plan changed', async () => {

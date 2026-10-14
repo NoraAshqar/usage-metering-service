@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { evaluate, remaining } from '../src/services/rules';
 
-// The example from the brief: account 10,000/month and 100/request, user 1,000/month and 20/request.
 const account = { monthlyLimit: 10_000, maxUnitsPerRequest: 100, used: 0 };
 const user = { monthlyLimit: 1_000, maxUnitsPerRequest: 20, used: 0 };
 

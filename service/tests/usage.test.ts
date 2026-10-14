@@ -15,7 +15,7 @@ describe('GET /usage', () => {
     const { apiKey } = await setupAccount(accountPlan, { alice: userPlan, bob: userPlan, carol: userPlan });
     await consumeUnits(apiKey, 'alice', 20);
     await consumeUnits(apiKey, 'bob', 15);
-    await consumeUnits(apiKey, 'bob', 25); // rejected: counts nowhere
+    await consumeUnits(apiKey, 'bob', 25);
 
     const res = await request(app).get('/usage').set('x-api-key', apiKey);
     assert.equal(res.status, 200);
@@ -24,7 +24,7 @@ describe('GET /usage', () => {
     assert.equal(res.body.account.monthlyLimit, 10_000);
 
     const byUser = Object.fromEntries(res.body.users.map((u: { userId: string; used: number }) => [u.userId, u.used]));
-    assert.deepEqual(byUser, { alice: 20, bob: 15, carol: 0 }); // carol has no usage yet
+    assert.deepEqual(byUser, { alice: 20, bob: 15, carol: 0 });
     assert.equal(res.body.nextOffset, null);
   });
 
