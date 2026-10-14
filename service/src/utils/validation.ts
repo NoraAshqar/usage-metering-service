@@ -63,3 +63,35 @@ export function requireIdParam(value: string, field: string): number {
   }
   return Number(value);
 }
+
+// ?month=2026-10  ->  '2026-10-01' (the value stored in the `month` columns).
+export function optionalMonthQuery(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^[0-9]{4}-(0[1-9]|1[0-2])$/.test(value)) {
+    throw invalid('month must look like 2026-10');
+  }
+  return `${value}-01`;
+}
+
+// Query values are strings, e.g. ?limit=20. Returns `fallback` when the value is missing.
+function queryInt(value: unknown, field: string, min: number, max: number, fallback: number): number {
+  if (value === undefined) return fallback;
+  const number = typeof value === 'string' && /^[0-9]{1,9}$/.test(value) ? Number(value) : NaN;
+  if (!(number >= min && number <= max)) {
+    throw invalid(`${field} must be a whole number between ${min} and ${max}`);
+  }
+  return number;
+}
+
+export interface Page {
+  limit: number;
+  offset: number;
+}
+
+// ?limit=20&offset=40  ->  rows 41-60. Default: the first 20 rows. At most 100 per page.
+export function pageQuery(query: { limit?: unknown; offset?: unknown }): Page {
+  return {
+    limit: queryInt(query.limit, 'limit', 1, 100, 20),
+    offset: queryInt(query.offset, 'offset', 0, 1_000_000_000, 0),
+  };
+}

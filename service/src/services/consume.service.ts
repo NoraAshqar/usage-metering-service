@@ -10,7 +10,7 @@ export interface ConsumeInput {
   requestId: string;
 }
 
-interface ConsumeRequestRow {
+export interface ConsumeRequestRow {
   user_id: number;
   request_id: string;
   units: number;
@@ -23,7 +23,8 @@ interface ConsumeRequestRow {
   created_at: Date;
 }
 
-function toDecisionResponse(row: ConsumeRequestRow, userId: string, replayed: boolean) {
+// One stored decision, as returned by /consume and by the request history (/requests).
+export function toRequestRecord(row: ConsumeRequestRow, userId: string) {
   return {
     requestId: row.request_id,
     userId,
@@ -31,10 +32,14 @@ function toDecisionResponse(row: ConsumeRequestRow, userId: string, replayed: bo
     accepted: row.accepted,
     rejectedBy: row.accepted ? null : { level: row.rejected_level, rule: row.rejected_rule },
     month: row.month.slice(0, 7), // '2026-10'
-    remaining: { account: row.account_remaining, user: row.user_remaining },
-    replayed, // true = this is a retry; the stored decision is returned and nothing new is consumed
+    remaining: { account: row.account_remaining, user: row.user_remaining }, // at decision time
     decidedAt: row.created_at,
   };
+}
+
+function toDecisionResponse(row: ConsumeRequestRow, userId: string, replayed: boolean) {
+  // replayed: true = this is a retry; the stored decision is returned and nothing new is consumed
+  return { ...toRequestRecord(row, userId), replayed };
 }
 
 // Locks this month's usage row (creating it first if needed) and returns `used`.

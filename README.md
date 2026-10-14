@@ -127,6 +127,41 @@ curl -X POST localhost:3000/consume -H "x-api-key: <key>" -H "content-type: appl
 - `4xx` means the request itself was wrong: `400` invalid input, `401` API key, `404` unknown user,
   `409` requestId already used for a different request.
 
+### Usage and history
+
+| Method | Path | Query | Result |
+|---|---|---|---|
+| GET | `/usage` | `month?`, `limit?`, `offset?` | the account's usage and one page of its users' usage |
+| GET | `/users/:userId/usage` | `month?` | one user's usage and the account's usage |
+| GET | `/requests` | `userId?`, `month?`, `limit?`, `offset?` | request history (accepted and rejected), newest first |
+
+- `month` looks like `2026-10`. Default for usage: the current UTC month. Default for history: all months.
+- `limit` is 1-100 (default 20), `offset` is the number of rows to skip (default 0).
+  `nextOffset` in the response is the `offset` for the next page, or `null` on the last page.
+
+```bash
+curl "localhost:3000/usage?month=2026-10" -H "x-api-key: <key>"
+```
+
+```json
+{
+  "month": "2026-10",
+  "account": { "used": 35, "monthlyLimit": 10000, "remaining": 9965, "plan": { "id": 1, "name": "Starter" } },
+  "users": [
+    { "userId": "alice", "used": 20, "monthlyLimit": 1000, "remaining": 980, "plan": { "id": 3, "name": "Basic" } },
+    { "userId": "bob",   "used": 15, "monthlyLimit": 1000, "remaining": 985, "plan": { "id": 3, "name": "Basic" } }
+  ],
+  "nextOffset": null
+}
+```
+
+```bash
+curl "localhost:3000/requests?userId=alice&limit=2" -H "x-api-key: <key>"
+```
+
+Each history entry has the same fields as a `/consume` response (without `replayed`).
+`remaining` there is the value **at the time of the decision**.
+
 ## Rules
 
 Each plan has two rules, and a request must satisfy **both** the account plan and the user plan:
@@ -223,9 +258,15 @@ removed `FOR UPDATE` and ran it again: 27 of the 50 requests were accepted (270 
   caller can tell "not allowed by the plan" apart from "your request was wrong".
 - **Rejected requests are stored** in the history too, so a caller can see why an action failed.
 - **The month of a request** is the UTC month in which the service processes it.
+- **Usage of past months uses today's plan.** Plans are not versioned, so `monthlyLimit` and
+  `remaining` in `/usage` are computed with the current plan, also for past months. The exact
+  remaining values at the time of each decision are kept in `/requests`.
+- **Users without usage** in a month are listed with `used: 0`.
+- **Pagination uses `limit`/`offset`.** It is simple, but if new requests arrive while a caller is
+  paging through the history, an entry can appear on two pages. A cursor (`?before=<id>`) would
+  avoid that; offset is enough for this scope.
 
 ## TODO
-- Usage and history API
 - Design decisions
 - Performance results
 - Known limitations
