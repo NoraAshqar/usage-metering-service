@@ -1,15 +1,31 @@
 # Usage Metering and Quota Service
 
-> Work in progress. Sections will be filled in as each part is built.
+A backend service that other applications call before a user performs an action. It checks the
+calling account's plan and the user's plan, records the decision, and counts the units if the
+request is accepted.
 
-## Run
+Stack: TypeScript, Express 5, PostgreSQL 16 (plain SQL with `pg`), Docker Compose.
+
+- [Quick start](#quick-start) · [Demo client](#demo-client) · [Tests](#tests)
+- [Accounts, users and plans](#accounts-users-and-plans) · [API](#api)
+- [Rules](#rules) · [Plan changes](#plan-changes) · [Retries](#retries-requestid) · [Concurrency](#how-concurrent-requests-stay-correct)
+- [Data model](#data-model) · [Performance](#performance) · [Design decisions](#design-decisions)
+- [Product assumptions](#product-assumptions) · [Known limitations](#known-limitations) · [Project structure](#project-structure)
+
+## Quick start
+
+Requirements: Docker with Docker Compose.
 
 ```bash
 docker compose up --build
 ```
 
-- Service: http://localhost:3000/health
-- PostgreSQL: localhost:5432 (user/password/db: `metering`)
+This starts PostgreSQL, the service and the demo client. The client runs its scenario once and
+exits; the service keeps running.
+
+- Service: http://localhost:3000 (`GET /health` returns `{"status":"ok"}`)
+- PostgreSQL: localhost:5432 (user, password and database: `metering`)
+- Admin key for creating accounts: `admin-secret` (`ADMIN_KEY` in `docker-compose.yml`)
 
 On startup the service applies any new SQL files from `service/migrations/` (schema + predefined
 plans) and records them in the `schema_migrations` table, so restarts keep all data.
@@ -53,18 +69,10 @@ Steps 4 and 5 change what users can do through the API only: the client code sta
 Configuration (environment variables): `SERVICE_URL` (default `http://localhost:3000`) and
 `ADMIN_KEY` (default `admin-secret`).
 
-## Predefined plans
-
-| Plan    | Level   | Monthly allowance | Max units / request |
-|---------|---------|------------------:|--------------------:|
-| Starter | account |            10,000 |                 100 |
-| Pro     | account |           100,000 |                 500 |
-| Basic   | user    |             1,000 |                  20 |
-| Premium | user    |             5,000 |                 100 |
-
 ## Tests
 
-The tests use Node's built-in test runner and the Postgres from Docker Compose:
+The tests use Node's built-in test runner (`node:test`) with `supertest`, against the Postgres
+from Docker Compose. Requirements: Node.js 22.
 
 ```bash
 docker compose up -d db
@@ -73,12 +81,52 @@ npm install
 npm test
 ```
 
-## API keys
+Every test creates its own accounts, so tests don't depend on each other or on existing data.
 
-1. The operator of the service creates an account with the admin key (`ADMIN_KEY`, default `admin-secret`).
-2. The response contains the account's API key **once**. Only its SHA-256 hash is stored.
+| File | Covers |
+|---|---|
+| `rules.test.ts` | the rule evaluation on its own (no database) |
+| `accounts-users.test.ts` | admin key, API key validation (missing / invalid), users, plan scope checks, account isolation |
+| `plans.test.ts` | custom plans, read-only predefined plans, shared plans, plan isolation |
+| `consume.test.ts` | the examples from the brief, accounting, new month, plan changes, retries, errors |
+| `usage.test.ts` | usage per account and user, past months, history filters and pagination, isolation |
+| `concurrency.test.ts` | parallel requests never exceed a limit, a duplicated `requestId` is counted once |
+
+## Accounts, users and plans
+
+| Concept | In this service |
+|---|---|
+| Account | An application calling the service. Identified by its API key. Has one **account plan** with limits shared by all its users. |
+| User | A user of that application, registered under one account with the `userId` the application already uses. Has one **user plan** with their own limits. |
+| Plan | A name and two rules (`monthlyLimit`, `maxUnitsPerRequest`) with a scope: `account` or `user`. Either predefined (shared by all accounts, read-only) or custom (owned by one account). |
+| Units | The single resource being metered, e.g. document processing credits. |
+
+A request has to satisfy the account plan **and** the user plan. A bigger user plan does not
+increase the account's shared allowance. Users on the same plan share the plan's rules, not its
+allowance: each user has their own usage.
+
+### Predefined plans
+
+Created on startup by `service/migrations/002_seed_plans.sql`:
+
+| Plan    | Scope   | Monthly allowance | Max units / request |
+|---------|---------|------------------:|--------------------:|
+| Starter | account |            10,000 |                 100 |
+| Pro     | account |           100,000 |                 500 |
+| Basic   | user    |             1,000 |                  20 |
+| Premium | user    |             5,000 |                 100 |
+
+Starter fits a small team (10 Basic users using everything would need exactly 10,000). Pro is ten
+times bigger. Premium users get 5× the Basic allowance and bigger single requests.
+
+### API keys
+
+1. The operator of the service creates an account with the admin key:
+   `POST /admin/accounts` with header `x-admin-key: admin-secret`.
+2. The response contains the account's API key (`mk_...`) **once**. Only its SHA-256 hash is stored.
 3. The calling application sends the key in the `x-api-key` header on every other request.
-   A missing or unknown key gets `401`. The key decides which account the request belongs to.
+   A missing or unknown key gets `401`. The key decides which account the request belongs to:
+   an account can only see and change its own users, plans, usage and history.
 
 ## API
 
@@ -223,6 +271,11 @@ usage, so the account's usage is always the sum of its users' usage.
 Usage is stored per UTC month (`2026-10-01` = October 2026). A new month starts at zero for
 both levels. Previous months stay in the database.
 
+No other rule types were added. The two required rules cover the brief, and a smaller, fully
+tested core was the priority. `evaluate()` in `service/src/services/rules.ts` is a pure function
+of the plans and the current usage, so a new rule (for example a daily limit) would be one more
+column on `plans`, one more `if` in `evaluate()`, and one more usage counter.
+
 ## Plan changes
 
 - `consume` reads the account plan and the user plan **at the start of every request**. A plan
@@ -273,6 +326,33 @@ finds the first one's saved decision.
 accepted and that the counters match the request history. As a check of the test itself, we
 removed `FOR UPDATE` and ran it again: 27 of the 50 requests were accepted (270 units for a
 100-unit allowance), so the test does catch the race.
+
+## Data model
+
+Defined in `service/migrations/001_schema.sql`.
+
+| Table | One row per | Main columns |
+|---|---|---|
+| `accounts` | calling application | `api_key_hash` (unique), `plan_id` |
+| `plans` | plan | `account_id` (`NULL` = predefined), `scope`, `monthly_limit`, `max_units_per_request` |
+| `users` | user of an account | `account_id`, `external_id` (the API's `userId`), `plan_id` |
+| `account_usage` | account and month | `used` |
+| `user_usage` | user and month | `used` |
+| `consume_requests` | decision, accepted or rejected | `request_id`, `units`, `accepted`, `rejected_level`, `rejected_rule`, remaining values |
+
+Constraints that protect the data even if the code had a bug:
+
+- `UNIQUE (account_id, request_id)`: a request can't be stored twice.
+- `FOREIGN KEY (user_id, account_id) REFERENCES users (id, account_id)`: a request can only be
+  stored for a user of the same account.
+- `CHECK`s: units are positive, `used` and remaining values are never negative, `month` is always
+  the first day of a month, and a rejected request always has a level and a rule while an
+  accepted one has neither.
+- Unique plan names per owner and scope (two partial unique indexes, because `NULL` is never equal
+  to `NULL` in a normal `UNIQUE` constraint).
+
+Migrations: on startup the service runs every file in `service/migrations/` that is not yet in
+the `schema_migrations` table, in name order, each in its own transaction (`src/migrate.ts`).
 
 ## Performance
 
@@ -367,6 +447,44 @@ accounts, the limit is the single Node process and the shared laptop CPU, not th
 - For a very hot account: give up exact real-time totals, e.g. reserve units in batches per
   process. That would trade accuracy for throughput, so it is not done here.
 
+## Design decisions
+
+**Usage counters next to the history.** Usage is kept in small counter tables per month
+(`account_usage`, `user_usage`) instead of summing `consume_requests` on every request. A decision
+reads two rows instead of a growing history, and the counter row is the natural thing to lock.
+The history is still complete, and the tests and the load test check that both always agree.
+
+**Row locks for concurrency.** Each request locks the account's usage row, then the user's
+(`SELECT ... FOR UPDATE`). Alternatives considered:
+
+- *A conditional update* (`UPDATE ... SET used = used + n WHERE used + n <= limit`) is one statement
+  per level, but with two levels it needs extra work to undo the first update when the second fails,
+  and to find out which rule rejected the request.
+- *`SERIALIZABLE` isolation* would also be correct, but conflicting requests fail and must be retried,
+  which is more code and more work exactly when an account is busy.
+
+Explicit locks keep the decision a normal piece of TypeScript (`evaluate()`) that runs on
+values nobody else can change at that moment. The cost is that requests of one account run one
+after another (see [Performance](#performance)).
+
+**Idempotency in the same table.** The `requestId` is stored with the decision in
+`consume_requests` under a unique constraint, so the retry check needs no extra table.
+
+**Rules as a pure function.** `rules.ts` has no database access. It is easy to read, has its own
+unit tests, and the consume service only loads data, locks, and saves.
+
+**Plain SQL, no ORM.** The locking and the queries are the core of this service, so they are
+written out in SQL where they can be read and explained directly.
+
+**SHA-256 for API keys.** Keys are 24 random bytes, so a slow password hash (bcrypt) is not
+needed, and a deterministic hash lets the service find the account with an index lookup.
+
+**Plans by reference.** Accounts and users store a `plan_id`, not a copy of the limits, so a
+plan update reaches everyone on that plan on their next request without any extra work.
+
+**Small dependency list.** Express 5 (async errors reach the error handler without wrappers),
+`pg`, and Node's built-in test runner. Migrations are a short script (`src/migrate.ts`) instead of a library.
+
 ## Product assumptions
 
 - **Default plans:** an account created without `planId` gets **Starter**; a user gets **Basic**.
@@ -399,6 +517,45 @@ accounts, the limit is the single Node process and the shared laptop CPU, not th
   paging through the history, an entry can appear on two pages. A cursor (`?before=<id>`) would
   avoid that; offset is enough for this scope.
 
-## TODO
-- Design decisions
-- Known limitations
+## Known limitations
+
+- **One account's throughput is limited by its lock.** Requests of the same account are decided
+  one after another. Many accounts scale well; one very busy account does not.
+- **One service process.** Node uses one CPU core, which was the first bottleneck in the load
+  test. Running several instances would work without code changes, because correctness relies
+  only on the database locks; the in-memory API key cache is safe per instance.
+- **Plans are not versioned.** `/usage` for a past month uses today's plan limits. The remaining
+  values at decision time are kept in `/requests`.
+- **No key rotation or revocation, no deleting accounts, users or plans.** The API key cache relies
+  on this; adding revocation would also mean clearing the cache.
+- **A single admin key** for creating accounts, compared as a plain string. No admin users or roles.
+- **The request history grows forever.** A real deployment would partition `consume_requests`
+  by month or archive old months.
+- **Offset pagination** can repeat an entry across pages if new requests arrive while paging.
+- **The month comes from the service's clock** (UTC). With several instances, their clocks would
+  need to agree around midnight at the end of a month.
+- **Tests use the same database as the Docker Compose stack.** They create their own accounts, so
+  they don't interfere with other data, but they do leave test data behind.
+- **No HTTPS or rate limiting** in the service itself; it is meant to run behind a proxy that
+  handles them.
+
+## Project structure
+
+```
+docker-compose.yml        db, service, client (+ loadtest profile)
+service/
+  migrations/             numbered SQL files: schema, predefined plans
+  src/
+    index.ts              runs migrations, starts the server
+    app.ts                Express app: routes and middleware
+    migrate.ts            applies new migration files
+    middleware/auth.ts    API key and admin key checks
+    routes/               HTTP: input validation and responses
+    services/             SQL and business logic
+      rules.ts            rule evaluation (pure function)
+      consume.service.ts  the consume transaction
+    utils/                validation, API keys, month helper
+  tests/                  node:test + supertest
+client/                   demo command-line client
+load-test/                autocannon load test and results
+```
